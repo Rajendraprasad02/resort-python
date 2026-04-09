@@ -81,6 +81,19 @@ async def update_asset_operational_status(
         raise HTTPException(status_code=404, detail="Asset not found")
     return asset
 
+@router.post("/{asset_id}/clone", response_model=PropertyAsset)
+async def clone_property_asset(
+    asset_id: int,
+    db: AsyncSession = Depends(deps.get_db)
+) -> Any:
+    """
+    Clone an existing asset to create a new one with same configurations.
+    """
+    asset = await asset_service.clone_asset(db, asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Original asset not found")
+    return asset
+
 @router.delete("/{asset_id}")
 async def delete_asset(
     asset_id: int,

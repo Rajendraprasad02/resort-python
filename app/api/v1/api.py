@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, users, knowledge, dashboard, ai, assets, stats, reservations, guests, whatsapp
+from app.api.v1.endpoints import auth, users, knowledge, dashboard, ai, assets, stats, reservations, guests, whatsapp, leads
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -12,3 +12,4 @@ api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(reservations.router, prefix="/reservations", tags=["reservations"])
 api_router.include_router(guests.router, prefix="/guests", tags=["guests"])
 api_router.include_router(whatsapp.router, prefix="/whatsapp", tags=["whatsapp"])
+api_router.include_router(leads.router, prefix="/leads", tags=["leads"])

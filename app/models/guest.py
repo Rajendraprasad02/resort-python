@@ -13,8 +13,6 @@ class Guest(Base):
     
     # Source Tracking
     source = Column(String, default="Direct") # Direct, Online, WhatsApp, OTA, Corporate, Social, Others
-    whatsapp_template_status = Column(String, default="NOT_SENT") # NOT_SENT, SENT, SUBMITTED
-    transferred_to_agent = Column(Boolean, default=False)
     
     # ID Verification
     id_proof_type = Column(String) # Passport, National ID, Driver License, Others

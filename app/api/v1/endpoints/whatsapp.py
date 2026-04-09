@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Request, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
@@ -11,7 +11,11 @@ from app.ai.agent_service import EliteHMAgent
 from app.services.whatsapp_service import whatsapp_service
 from app.models.conversation import Conversation
 from app.models.guest import Guest
+from app.models.lead import Lead
 import json
+import base64
+import re
+import os
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -72,14 +76,24 @@ async def background_process_ai_response(from_number: str, text_body: str, media
                 if convo.ai_response:
                     history.append({"role": "assistant", "content": convo.ai_response})
 
-            # 3. IDENTIFY GUEST
-            wa_logger.info(f"Step 3: Checking Guest Database for {db_from_number}...")
+            # 3. IDENTIFY GUEST OR LEAD
+            wa_logger.info(f"Step 3: Checking Databases for {db_from_number}...")
+            
+            # Check for existing Guest
             guest_stmt = select(Guest).where(Guest.phone == db_from_number)
             res = await db.execute(guest_stmt)
             guest = res.scalar_one_or_none()
+            
+            # Check for existing Lead
+            lead_stmt = select(Lead).where(Lead.phone == db_from_number)
+            res = await db.execute(lead_stmt)
+            lead = res.scalar_one_or_none()
 
             # --- HANDOFF BYPASS ---
-            if guest and guest.transferred_to_agent:
+            # Check handoff from Lead first, then Guest (backwards compatibility)
+            is_transferred = (lead and lead.transferred_to_agent) or (guest and getattr(guest, 'transferred_to_agent', False))
+            
+            if is_transferred:
                 wa_logger.info(f"User {db_from_number} is assigned to an agent. Bypassing AI.")
                 msg_val = "Submitted Registration Form" if "[FORM_SUBMITTED" in text_body else text_body
                 new_convo = Conversation(
@@ -87,7 +101,8 @@ async def background_process_ai_response(from_number: str, text_body: str, media
                     user_message=msg_val,
                     ai_response=None,
                     provider="live_agent",
-                    guest_id=guest.id
+                    guest_id=guest.id if guest else None,
+                    lead_id=lead.id if lead else None
                 )
                 db.add(new_convo)
                 await db.commit()
@@ -119,20 +134,24 @@ async def background_process_ai_response(from_number: str, text_body: str, media
 
             # Check if this is a form submission message
             elif "[FORM_SUBMITTED" in text_body:
-                if guest:
-                    guest.whatsapp_template_status = "SUBMITTED"
-                    # Parse JSON to update guest details natively
+                # Prioritize updating Lead, but also update Guest if it exists
+                target_obj = lead or guest
+                if target_obj:
+                    if hasattr(target_obj, 'whatsapp_template_status'):
+                        target_obj.whatsapp_template_status = "SUBMITTED"
+                    
                     try:
                         json_str = text_body.replace("[FORM_SUBMITTED: ", "")[:-1]
                         form_data = json.loads(json_str)
                         first_name = form_data.get("screen_0_First_0", "")
                         last_name = form_data.get("screen_0_Last_1", "")
-                        guest.name = f"{first_name} {last_name}".strip() or "WhatsApp User"
-                        guest.email = form_data.get("screen_0_Email_2", guest.email)
-                        guest.address = form_data.get("screen_0_Address_4", guest.address)
+                        target_obj.name = f"{first_name} {last_name}".strip() or "WhatsApp User"
+                        target_obj.email = form_data.get("screen_0_Email_2", target_obj.email)
+                        if hasattr(target_obj, 'address'):
+                            target_obj.address = form_data.get("screen_0_Address_4", getattr(target_obj, 'address', None))
                         
                         await db.commit()
-                        await db.refresh(guest) # CRITICAL: avoid greenlet_spawn error
+                        await db.refresh(target_obj)
                     except Exception as e:
                         await db.rollback()
                         wa_logger.error(f"Form parsing error: {e}")
@@ -142,26 +161,25 @@ async def background_process_ai_response(from_number: str, text_body: str, media
                 # Override raw query to prevent PII Guardrail failure, but DB uses db_message_val
                 text_body = "I have successfully submitted my registration form."
 
-            elif guest is None:
-                guest = Guest(
+            elif guest is None and lead is None:
+                # New user -> Create a Lead instead of a Guest
+                lead = Lead(
                     phone=db_from_number, 
                     name="Unknown WhatsApp User", 
                     email=f"{from_number}@whatsapp.invalid",
-                    id_number="PENDING",
                     source="WhatsApp",
                     whatsapp_template_status="NOT_SENT"
                 )
-                db.add(guest)
+                db.add(lead)
                 await db.commit()
-                await db.refresh(guest)
+                await db.refresh(lead)
                 needs_form = True
-            elif guest.whatsapp_template_status != "SUBMITTED":
-                # If an admin or OTA created this guest, they already have a real name. We shouldn't send the form.
-                if guest.name and guest.name != "Unknown WhatsApp User":
-                    guest.whatsapp_template_status = "SUBMITTED"
-                    await db.commit()
-                else:
-                    needs_form = True
+            elif lead and lead.whatsapp_template_status != "SUBMITTED":
+                needs_form = True
+            elif guest and lead is None:
+                # Existing guest contact but no lead record (rare case)
+                # We could create a lead or just proceed. Here we proceed.
+                pass
 
             if needs_form:
                  # Wrap the text body with system instructions for the LLM
@@ -181,8 +199,11 @@ async def background_process_ai_response(from_number: str, text_body: str, media
             wa_logger.info(f"LLM Response Generated: {len(ai_response)} chars.")
 
             # AUTO-HANDOFF DETECTION
-            if "live agent" in ai_response.lower() and guest:
-                guest.transferred_to_agent = True
+            if "live agent" in ai_response.lower():
+                if lead:
+                    lead.transferred_to_agent = True
+                if guest and hasattr(guest, 'transferred_to_agent'):
+                    guest.transferred_to_agent = True
                 await db.commit()
                 wa_logger.info(f"Agent Handoff triggered for {from_number}")
 
@@ -192,7 +213,8 @@ async def background_process_ai_response(from_number: str, text_body: str, media
                 user_message=db_message_val,
                 ai_response=ai_response,
                 provider=provider,
-                guest_id=guest.id if guest else None
+                guest_id=guest.id if guest else None,
+                lead_id=lead.id if lead else None
             )
             db.add(new_convo)
             await db.commit()
@@ -205,7 +227,10 @@ async def background_process_ai_response(from_number: str, text_body: str, media
                 from app.services.whatsapp_templates import get_template_payload
                 template_payload = get_template_payload(from_number, "basic_details")
                 await whatsapp_service.send_template_message(from_number, template_payload)
-                if guest:
+                if lead:
+                    lead.whatsapp_template_status = "SENT"
+                    await db.commit()
+                elif guest and hasattr(guest, 'whatsapp_template_status'):
                     guest.whatsapp_template_status = "SENT"
                     await db.commit()
 
@@ -259,8 +284,26 @@ async def receive_whatsapp_message(
         entry = body.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
-        messages = value.get("messages", [])
         
+        # --- HANDLE STATUS UPDATES (Sent, Delivered, Read, Failed) ---
+        statuses = value.get("statuses", [])
+        if statuses:
+            status = statuses[0]
+            msg_id = status.get("id")
+            status_val = status.get("status")
+            recipient = status.get("recipient_id")
+            
+            if status_val == "failed":
+                errors = status.get("errors", [])
+                err_msg = errors[0].get("message") if errors else "Unknown logic error"
+                wa_logger.error(f"[STATUS] {msg_id} to {recipient} FAILED: {err_msg}")
+                term_alert(f"[STATUS] {msg_id} FAILED: {err_msg}")
+            else:
+                wa_logger.info(f"[STATUS] {msg_id} to {recipient} is {status_val}")
+            
+            return {"status": "success"}
+
+        messages = value.get("messages", [])
         if not messages:
             return {"status": "success"}
 
@@ -348,12 +391,30 @@ async def get_conversation_by_sender(
     result = await db.execute(stmt)
     convos = result.scalars().all()
     
-    return convos
+    # Calculate window status
+    from datetime import datetime, timedelta
+    window_open = False
+    time_left = None
+    
+    last_user_msg = next((c for c in reversed(convos) if c.user_message != "[Admin Outbound]"), None)
+    if last_user_msg:
+        time_diff = datetime.utcnow() - last_user_msg.created_at
+        if time_diff < timedelta(hours=24):
+            window_open = True
+            time_left = str(timedelta(hours=24) - time_diff).split(".")[0]
+            
+    return {
+        "sender_number": sender_number,
+        "window_open": window_open,
+        "time_left": time_left,
+        "messages": convos
+    }
 
 from pydantic import BaseModel
 
 class AdminMessageRequest(BaseModel):
-    message: str
+    message: Optional[str] = None
+    image_url: Optional[str] = None
 
 @router.post("/conversations/{sender_number}/send")
 async def send_admin_message(
@@ -365,36 +426,144 @@ async def send_admin_message(
     Allows a human admin to send a message directly to the guest.
     Automatically flags the conversation as 'live_agent' and mutes AI responses.
     """
-    if not payload.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if not payload.message and not payload.image_url:
+        raise HTTPException(status_code=400, detail="Either message or image_url must be provided")
         
     db_from_number = f"+{sender_number.strip()}" if not sender_number.startswith("+") else sender_number
     raw_number = sender_number.replace("+", "").strip()
 
-    # Find the guest to forcefully silence the AI agent
+    # Find the guest or lead to forcefully silence the AI agent
     guest_stmt = select(Guest).where(Guest.phone == db_from_number)
     res = await db.execute(guest_stmt)
     guest = res.scalar_one_or_none()
-    guest_id = guest.id if guest else None
+    
+    lead_stmt = select(Lead).where(Lead.phone == db_from_number)
+    res = await db.execute(lead_stmt)
+    lead = res.scalar_one_or_none()
+
+    # --- 24-HOUR WINDOW CHECK ---
+    from datetime import datetime, timedelta
+    
+    # Logic: Window is open if the LAST message from the user was within 24 hours.
+    # We ignore [Admin Outbound] and look for real incoming messages.
+    window_stmt = select(Conversation).where(
+        Conversation.sender_number == db_from_number,
+        Conversation.user_message != "[Admin Outbound]"
+    ).order_by(Conversation.created_at.desc()).limit(1)
+    
+    window_res = await db.execute(window_stmt)
+    last_user_message = window_res.scalar_one_or_none()
+    
+    if last_user_message:
+        # Check if it was more than 24 hours ago
+        time_diff = datetime.utcnow() - last_user_message.created_at
+        if time_diff > timedelta(hours=24):
+            raise HTTPException(
+                status_code=403, 
+                detail=f"WhatsApp 24-hour window is CLOSED. Last customer message was {time_diff.hours if hasattr(time_diff, 'hours') else int(time_diff.total_seconds() // 3600)}h ago. Ask them to message you first."
+            )
+    else:
+        # No history found, assume window is unknown or closed
+        raise HTTPException(status_code=403, detail="No incoming message found from this user. You cannot initiate a conversation.")
 
     # Ask whatsapp_service to send it
-    wa_res = await whatsapp_service.send_text_message(recipient_number=raw_number, text=payload.message)
+    if payload.image_url:
+        media_id = None
+        # Handle Base64 Data URLs
+        if payload.image_url.startswith("data:image"):
+            try:
+                # Extract base64 data and mime type
+                # format: data:image/jpeg;base64,/9j/4AAQSk...
+                match = re.search(r'data:(image/\w+);base64,(.*)', payload.image_url)
+                if match:
+                    mime_type = match.group(1)
+                    ext = mime_type.split('/')[-1]
+                    image_data = base64.b64decode(match.group(2))
+                    
+                    wa_logger.info(f"Uploading base64 image ({len(image_data)} bytes)...")
+                    media_id = await whatsapp_service.upload_media(
+                        media_content=image_data,
+                        filename=f"admin_upload.{ext}",
+                        mime_type=mime_type
+                    )
+                    wa_logger.info(f"Base64 Upload success, Media ID: {media_id}")
+            except Exception as e:
+                wa_logger.error(f"Base64 processing failed: {e}")
+        
+        # Handle Local Project URLs (localhost or current domain uploads)
+        elif "/uploads/" in payload.image_url:
+            try:
+                # Extract the relative path. e.g. /uploads/property_images/abc.jpg
+                # We expect the URL to contain '/uploads/'
+                path_part = payload.image_url.split("/uploads/")[1]
+                # Normalize slashes for Windows/Linux consistency
+                path_part = path_part.replace("/", os.sep).replace("\\", os.sep)
+                file_path = os.path.join("uploads", path_part)
+                
+                if os.path.exists(file_path):
+                    with open(file_path, "rb") as f:
+                        image_data = f.read()
+                    
+                    mime_type = "image/jpeg" # Default
+                    if file_path.lower().endswith(".png"): mime_type = "image/png"
+                    elif file_path.lower().endswith(".webp"): mime_type = "image/webp"
+                    
+                    wa_logger.info(f"Uploading local file {file_path} ({len(image_data)} bytes)...")
+                    media_id = await whatsapp_service.upload_media(
+                        media_content=image_data,
+                        filename=os.path.basename(file_path),
+                        mime_type=mime_type
+                    )
+                    if media_id:
+                        wa_logger.info(f"Local file upload success, Media ID: {media_id}")
+                    else:
+                        wa_logger.error("Local file upload failed (no media_id returned)")
+                else:
+                    wa_logger.error(f"Local file not found: {file_path}")
+            except Exception as e:
+                wa_logger.error(f"Local file processing failed: {e}")
+
+        # Construct the path to log in DB (always relative path)
+        log_url = payload.image_url
+        if media_id and payload.image_url.startswith("data:image"):
+             log_url = "Meta_Upload"
+        elif "/uploads/" in payload.image_url:
+             log_url = f"/uploads/{payload.image_url.split('/uploads/')[1]}"
+
+        wa_res = await whatsapp_service.send_image_message(
+            recipient_number=raw_number, 
+            image_url=payload.image_url if not media_id else None, 
+            media_id=media_id,
+            caption=payload.message
+        )
+        msg_to_log = f"[Image: {log_url}] " + (payload.message or "")
+    else:
+        wa_res = await whatsapp_service.send_text_message(
+            recipient_number=raw_number, 
+            text=payload.message
+        )
+        msg_to_log = payload.message
     
     if wa_res.get("status") == "error":
         wa_logger.error(f"[ADMIN FAILED] Meta API Refused: {wa_res.get('message')}")
         raise HTTPException(status_code=500, detail=wa_res.get("message"))
 
-    # Update guest status and log the message in one transaction
-    if guest:
+    # Update status and log the message in one transaction
+    if lead:
+        lead.transferred_to_agent = True
+        db.add(lead)
+    
+    if guest and hasattr(guest, 'transferred_to_agent'):
         guest.transferred_to_agent = True
         db.add(guest)
 
     new_convo = Conversation(
         sender_number=db_from_number,
         user_message="[Admin Outbound]",
-        ai_response=payload.message,
+        ai_response=msg_to_log,
         provider="live_agent",
-        guest_id=guest_id
+        guest_id=guest.id if guest else None,
+        lead_id=lead.id if lead else None
     )
     db.add(new_convo)
     await db.commit()

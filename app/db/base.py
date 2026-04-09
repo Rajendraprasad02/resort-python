@@ -6,3 +6,4 @@ from app.models.asset import PropertyAsset
 from app.models.reservation import Reservation
 from app.models.guest import Guest
 from app.models.conversation import Conversation
+from app.models.lead import Lead

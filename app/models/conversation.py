@@ -13,6 +13,9 @@ class Conversation(Base):
     provider = Column(String, nullable=True) # groq or gemini
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # Optional: If we want to link it to a specific Guest record later
+    # Optional: Links to Lead or Guest
     guest_id = Column(Integer, ForeignKey("guest.id"), nullable=True)
+    lead_id = Column(Integer, ForeignKey("lead.id"), nullable=True)
+
     guest = relationship("Guest", backref="conversations")
+    lead = relationship("Lead", back_populates="conversations")

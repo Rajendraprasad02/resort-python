@@ -35,7 +35,8 @@ class PropertyAsset(Base):
     # Relationship for Multiple Images
     images = relationship("AssetImage", back_populates="asset", cascade="all, delete-orphan", lazy="selectin")
     
-    # Timestamps
+    # Timestamps & Soft Delete
+    is_deleted = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
